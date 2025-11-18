@@ -40,19 +40,46 @@ def create_risk_matrix(df, theme):
     impact_order = ['Negligible', 'Marginal', 'Serious', 'Critical', 'Catastrophic']
     probability_order = ['Rare', 'Unlikely', 'Moderate', 'Likely', 'Almost Certain']
     
-    # Create count matrix
+    # Create count matrix and risk ID matrix
     matrix_data = []
+    risk_ids_matrix = []
+    
     for impact in impact_order:
-        row = []
+        row_counts = []
+        row_risk_ids = []
         for probability in probability_order:
-            count = len(df[
+            risks = df[
                 (df['Impact / Consequence Rating'] == impact) & 
                 (df['Probability / Likelihood Rating'] == probability)
-            ])
-            row.append(count)
-        matrix_data.append(row)
+            ]
+            count = len(risks)
+            risk_ids = ', '.join(risks['Risk ID'].astype(str)) if len(risks) > 0 else 'None'
+            row_counts.append(count)
+            row_risk_ids.append(risk_ids)
+        matrix_data.append(row_counts)
+        risk_ids_matrix.append(row_risk_ids)
     
-    # Create heatmap
+    # Create custom hover text
+    hover_text = []
+    for i, impact in enumerate(impact_order):
+        hover_row = []
+        for j, probability in enumerate(probability_order):
+            count = matrix_data[i][j]
+            risk_ids = risk_ids_matrix[i][j]
+            if count > 0:
+                hover_text.append(f"<b>Impact:</b> {impact}<br><b>Probability:</b> {probability}<br><b>Number of Risks:</b> {count}<br><b>Risk IDs:</b> {risk_ids}")
+            else:
+                hover_text.append(f"<b>Impact:</b> {impact}<br><b>Probability:</b> {probability}<br><b>Number of Risks:</b> 0<br><b>Risk IDs:</b> None")
+        #hover_text.append(hover_row)
+    
+    # Reshape hover text to match matrix shape
+    hover_text_2d = []
+    for i in range(len(impact_order)):
+        start_idx = i * len(probability_order)
+        end_idx = start_idx + len(probability_order)
+        hover_text_2d.append(hover_text[start_idx:end_idx])
+    
+    # Create heatmap with custom hover data
     fig = px.imshow(
         matrix_data,
         x=probability_order,
@@ -60,6 +87,12 @@ def create_risk_matrix(df, theme):
         labels=dict(x="Probability", y="Impact", color="Number of Risks"),
         color_continuous_scale=THEMES[theme],
         aspect="auto"
+    )
+    
+    # Update hover template
+    fig.update_traces(
+        hovertemplate='%{customdata}<extra></extra>',
+        customdata=hover_text_2d
     )
     
     # Add annotations
@@ -73,7 +106,7 @@ def create_risk_matrix(df, theme):
             )
     
     fig.update_layout(
-        title="Risk Assessment Matrix Heatmap",
+        title="Risk Assessment Matrix Heatmap<br><sub>Hover over cells to see Risk IDs</sub>",
         xaxis_title="Probability / Likelihood Rating",
         yaxis_title="Impact / Consequence Rating",
         height=600
@@ -123,14 +156,21 @@ def create_bubble_chart(df, theme):
         fig.update_layout(height=600)
         return fig
     
-    # Create bubble chart
+    # Create bubble chart with enhanced hover
     fig = px.scatter(
         bubble_df,
         x='Probability_Numeric',
         y='Impact_Numeric',
         size='Count',
         size_max=50,
-        hover_data=['Impact', 'Probability', 'Count', 'Risk_Ids'],
+        hover_data={
+            'Impact': True,
+            'Probability': True,
+            'Count': True,
+            'Risk_Ids': True,
+            'Impact_Numeric': False,
+            'Probability_Numeric': False
+        },
         color='Count',
         color_continuous_scale=THEMES[theme],
         labels={
@@ -138,6 +178,14 @@ def create_bubble_chart(df, theme):
             'Impact_Numeric': 'Impact',
             'Count': 'Number of Risks'
         }
+    )
+    
+    # Customize hover template
+    fig.update_traces(
+        hovertemplate='<b>Impact:</b> %{customdata[0]}<br>' +
+                     '<b>Probability:</b> %{customdata[1]}<br>' +
+                     '<b>Number of Risks:</b> %{customdata[2]}<br>' +
+                     '<b>Risk IDs:</b> %{customdata[3]}<extra></extra>'
     )
     
     # Update axes
@@ -151,7 +199,7 @@ def create_bubble_chart(df, theme):
     )
     
     fig.update_layout(
-        title="Risk Assessment Bubble Chart",
+        title="Risk Assessment Bubble Chart<br><sub>Hover over bubbles to see Risk IDs</sub>",
         xaxis_title="Probability / Likelihood Rating",
         yaxis_title="Impact / Consequence Rating",
         height=600,
@@ -173,6 +221,12 @@ def create_bar_charts(df, theme):
     impact_order = ['Negligible', 'Marginal', 'Serious', 'Critical', 'Catastrophic']
     impact_counts = impact_counts.reindex([x for x in impact_order if x in impact_counts.index], fill_value=0)
     
+    # Get risk IDs for each impact level
+    impact_risk_ids = {}
+    for impact in impact_counts.index:
+        risks = df[df['Impact / Consequence Rating'] == impact]
+        impact_risk_ids[impact] = ', '.join(risks['Risk ID'].astype(str)) if len(risks) > 0 else 'None'
+    
     # Safe color calculation
     if len(impact_counts) > 0:
         if len(impact_counts) == 1:
@@ -187,7 +241,11 @@ def create_bar_charts(df, theme):
             x=impact_counts.index,
             y=impact_counts.values,
             name='Impact',
-            marker_color=colors
+            marker_color=colors,
+            customdata=[impact_risk_ids[impact] for impact in impact_counts.index],
+            hovertemplate='<b>Impact:</b> %{x}<br>' +
+                         '<b>Number of Risks:</b> %{y}<br>' +
+                         '<b>Risk IDs:</b> %{customdata}<extra></extra>'
         ),
         row=1, col=1
     )
@@ -197,6 +255,12 @@ def create_bar_charts(df, theme):
     # Reindex to maintain order
     probability_order = ['Rare', 'Unlikely', 'Moderate', 'Likely', 'Almost Certain']
     probability_counts = probability_counts.reindex([x for x in probability_order if x in probability_counts.index], fill_value=0)
+    
+    # Get risk IDs for each probability level
+    probability_risk_ids = {}
+    for probability in probability_counts.index:
+        risks = df[df['Probability / Likelihood Rating'] == probability]
+        probability_risk_ids[probability] = ', '.join(risks['Risk ID'].astype(str)) if len(risks) > 0 else 'None'
     
     # Safe color calculation
     if len(probability_counts) > 0:
@@ -212,13 +276,17 @@ def create_bar_charts(df, theme):
             x=probability_counts.index,
             y=probability_counts.values,
             name='Probability',
-            marker_color=colors_prob
+            marker_color=colors_prob,
+            customdata=[probability_risk_ids[probability] for probability in probability_counts.index],
+            hovertemplate='<b>Probability:</b> %{x}<br>' +
+                         '<b>Number of Risks:</b> %{y}<br>' +
+                         '<b>Risk IDs:</b> %{customdata}<extra></extra>'
         ),
         row=1, col=2
     )
     
     fig.update_layout(
-        title_text="Risk Distribution Analysis",
+        title_text="Risk Distribution Analysis<br><sub>Hover over bars to see Risk IDs</sub>",
         height=500,
         showlegend=False
     )
@@ -257,6 +325,23 @@ def create_treemap(df, theme):
     # Create risk level counts
     risk_level_counts = treemap_df.groupby(['Impact', 'Probability', 'Risk_Level']).size().reset_index(name='Count')
     
+    # Get all risk IDs for each combination
+    risk_ids_by_combo = {}
+    for _, row in risk_level_counts.iterrows():
+        impact = row['Impact']
+        probability = row['Probability']
+        risks = df[
+            (df['Impact / Consequence Rating'] == impact) & 
+            (df['Probability / Likelihood Rating'] == probability)
+        ]
+        risk_ids_by_combo[(impact, probability)] = ', '.join(risks['Risk ID'].astype(str))
+    
+    # Add risk IDs to the dataframe
+    risk_level_counts['Risk_Ids'] = risk_level_counts.apply(
+        lambda x: risk_ids_by_combo.get((x['Impact'], x['Probability']), 'None'), 
+        axis=1
+    )
+    
     # Create treemap
     fig = px.treemap(
         risk_level_counts,
@@ -264,7 +349,15 @@ def create_treemap(df, theme):
         values='Count',
         color='Impact',
         color_continuous_scale=THEMES[theme],
-        title="Risk Distribution Treemap"
+        title="Risk Distribution Treemap<br><sub>Hover over sections to see Risk IDs</sub>",
+        custom_data=['Risk_Ids']
+    )
+    
+    # Update hover template
+    fig.update_traces(
+        hovertemplate='<b>%{label}</b><br>' +
+                     'Number of Risks: %{value}<br>' +
+                     'Risk IDs: %{customdata[0]}<extra></extra>'
     )
     
     fig.update_layout(height=600)
