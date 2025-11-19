@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: streamlit-app
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "streamlit run risk-classification.py --server.port $PORT --server.address 0.0.0.0"
+    autoDeploy: true
+
