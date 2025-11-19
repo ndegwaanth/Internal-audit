@@ -4,7 +4,9 @@ services:
     env: python
     region: oregon
     plan: free
-    buildCommand: "pip install -r requirements.txt"
+    buildCommand: |
+      apt-get update && apt-get install -y build-essential libatlas-base-dev
+      pip install --upgrade pip
+      pip install --retries 10 --timeout 120 -r requirements.txt
     startCommand: "streamlit run risk-classification.py --server.port $PORT --server.address 0.0.0.0"
     autoDeploy: true
-
