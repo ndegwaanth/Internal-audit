@@ -1,408 +1,543 @@
-# risk_dashboard.py
-import streamlit as st
 import pandas as pd
-import numpy as np
-from io import BytesIO
-import plotly.graph_objects as go
 import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import streamlit as st
 
-# Optional click-event support
-try:
-    from streamlit_plotly_events import plotly_events  # type: ignore
-    PLOTLY_EVENTS = True
-except Exception:
-    PLOTLY_EVENTS = False
-
-st.set_page_config(page_title="Broadway Risk Dashboard", layout="wide")
-st.title("Broadway — Interactive Risk Dashboard")
-st.markdown(
-    "Upload your Excel risk register and explore risks with a high-contrast heatmap (or Tree/Bubble map). "
-    "Click a heatmap cell to list Risk IDs and view RISK + CONSEQUENCE/IMPACT details."
-)
-
-# ---------------------------
-# Constants: exact label orders
-# ---------------------------
-PROBABILITY_ORDER = ["Almost Certain", "Likely", "Moderate", "Unlikely", "Rare"]
-IMPACT_ORDER = ["Negligible", "Marginal", "Serious", "Critical", "Catastrophic"]
-
-# color options (high contrast)
-COLOR_OPTIONS = ["Turbo", "Viridis", "Cividis", "Plasma", "Reds"]
-
-# ---------------------------
-# Helpers
-# ---------------------------
-def read_excel(uploaded) -> pd.DataFrame:
-    """Read excel and dedupe duplicate column headers safely."""
-    df = pd.read_excel(uploaded, engine="openpyxl")
-    # dedupe duplicate headers (Risk ID, Risk ID_1, etc.)
-    if len(df.columns) != len(set(df.columns)):
-        df.columns = pd.io.parsers.ParserBase({'names': df.columns})._maybe_dedup_names(df.columns)
-    return df
-
-def map_exact_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Rename exact known columns to canonical names used in the app."""
-    mapping = {
-        "Risk ID": "risk_id",
-        "RISKS": "risk",
-        "CONSEQUENCE/ IMPACT": "consequence_impact",
-        "Impact / Consequence Rating": "impact_rating",
-        "Probability / Likelihood Rating": "probability_rating"
-    }
-    df = df.rename(columns=mapping)
-    return df
-
-def normalize_rating_text(val: any) -> str | None:
-    """Return a cleaned rating string if it matches one of the expected textual categories."""
-    if pd.isna(val):
+# Load and process the data
+@st.cache_data
+def load_data(uploaded_file):
+    try:
+        # Try reading the Excel file
+        df = pd.read_excel(uploaded_file, sheet_name='Sheet1')
+        
+        # Clean column names
+        df.columns = [col.strip() for col in df.columns]
+        
+        # Standardize rating columns
+        rating_columns = ['Impact / Consequence Rating', 'Probability / Likelihood Rating']
+        
+        for col in rating_columns:
+            if col in df.columns:
+                df[col] = df[col].astype(str).str.strip().str.title()
+        
+        return df
+    except Exception as e:
+        st.error(f"Error loading data: {str(e)}")
         return None
-    s = str(val).strip()
-    # Accept common typos/case-insensitive mapping (e.g., "Likely", "Likeliy")
-    # We'll match by first characters / case-insensitive exact words
-    s_lower = s.lower()
-    # map known alternatives
-    alt_map = {
-        "almost certain": "Almost Certain",
-        "almost_certain": "Almost Certain",
-        "almostcertain": "Almost Certain",
-        "likely": "Likely",
-        "likeliy": "Likely",   # handle typo user earlier had
-        "moderate": "Moderate",
-        "moderately": "Moderate",
-        "unlikely": "Unlikely",
-        "rare": "Rare",
-        "negligible": "Negligible",
-        "marginal": "Marginal",
-        "serious": "Serious",
-        "critical": "Critical",
-        "catastrophic": "Catastrophic"
-    }
-    # direct normalization if exact match ignoring case
-    for key, label in alt_map.items():
-        if key == s_lower or key in s_lower:
-            return label
-    return None
 
-def prepare_matrix(df: pd.DataFrame) -> (pd.DataFrame, dict):
-    """
-    Build a matrix (DataFrame) with index=PROBABILITY_ORDER, columns=IMPACT_ORDER
-    and values = count of risks. Also return cell mapping with Risk IDs and details.
-    """
-    # Ensure canonical columns exist
-    if not all(c in df.columns for c in ["probability_rating", "impact_rating", "risk_id", "risk", "consequence_impact"]):
-        # Data missing - return empty
-        empty_mat = pd.DataFrame(0, index=PROBABILITY_ORDER, columns=IMPACT_ORDER)
-        return empty_mat, {}
+# Define color themes
+THEMES = {
+    "Red-Yellow-Green (Risk Matrix)": "RdYlGn_r",
+    "Viridis (High Contrast)": "viridis",
+    "Plasma (Warm)": "plasma",
+    "Inferno (Hot)": "inferno",
+    "Blues (Cool)": "blues"
+}
 
-    # Normalize rating strings
-    df = df.copy()
-    df["probability_rating_norm"] = df["probability_rating"].apply(normalize_rating_text)
-    df["impact_rating_norm"] = df["impact_rating"].apply(normalize_rating_text)
-    # Filter to rows that successfully normalized to expected categories
-    df = df[df["probability_rating_norm"].notna() & df["impact_rating_norm"].notna()]
-
-    # Create mapping and matrix
-    mat = pd.DataFrame(0, index=PROBABILITY_ORDER, columns=IMPACT_ORDER)
-    cell_map = {}  # (prob, impact) -> {"count": int, "risk_ids": [...], "risks": [...], "consequences": [...]}
-
-    for _, row in df.iterrows():
-        p = row["probability_rating_norm"]
-        i = row["impact_rating_norm"]
-        if p not in PROBABILITY_ORDER or i not in IMPACT_ORDER:
-            continue
-        mat.at[p, i] += 1
-        key = (p, i)
-        if key not in cell_map:
-            cell_map[key] = {"count": 0, "risk_ids": [], "risks": [], "consequences": []}
-        cell_map[key]["count"] += 1
-        cell_map[key]["risk_ids"].append(str(row.get("risk_id", "")))
-        cell_map[key]["risks"].append(str(row.get("risk", "")))
-        cell_map[key]["consequences"].append(str(row.get("consequence_impact", "")))
-    return mat, cell_map
-
-def build_heatmap_figure(mat: pd.DataFrame, color_scale: str, value_mode: str, cell_map: dict, filters_text: str) -> go.Figure:
-    """
-    value_mode: "Count" or "AverageSeverity"
-    For AverageSeverity we compute severity = ordinal(prob) * ordinal(impact) and average per cell.
-    """
-    z = mat.values.astype(float)  # counts by default
-
-    # If AverageSeverity requested, compute severity average per cell
-    if value_mode == "AverageSeverity":
-        # Placeholder: we'll convert category to numeric scale 1..5 by their index
-        prob_idx = {label: idx+1 for idx, label in enumerate(PROBABILITY_ORDER)}
-        impact_idx = {label: idx+1 for idx, label in enumerate(IMPACT_ORDER)}
-        # compute sum and counts
-        sum_mat = np.zeros_like(z)
-        cnt_mat = np.zeros_like(z)
-        # iterate cell_map to fill sums
-        for r, c in cell_map.keys():
-            pr = prob_idx[r]
-            ic = impact_idx[c]
-            key = (r, c)
-            sev_each = pr * ic
-            idx_r = PROBABILITY_ORDER.index(r)
-            idx_c = IMPACT_ORDER.index(c)
-            count = cell_map[key]["count"]
-            sum_mat[idx_r, idx_c] = sev_each * count
-            cnt_mat[idx_r, idx_c] = count
-        with np.errstate(invalid='ignore', divide='ignore'):
-            avg_mat = np.divide(sum_mat, np.where(cnt_mat == 0, np.nan, cnt_mat))
-            avg_mat = np.nan_to_num(avg_mat, nan=0.0)
-        z = avg_mat
-
-    # Build hover text from cell_map
-    hover = []
-    for r in PROBABILITY_ORDER:
-        row_hover = []
-        for c in IMPACT_ORDER:
-            k = (r, c)
-            info = cell_map.get(k, {"count": 0, "risk_ids": []})
-            if value_mode == "AverageSeverity":
-                val = float(z[PROBABILITY_ORDER.index(r), IMPACT_ORDER.index(c)])
-                h = f"Probability: {r}<br>Impact: {c}<br>Avg Severity: {val:.1f}<br>Count: {info['count']}"
+def create_risk_matrix(df, theme):
+    # Define the order for ratings
+    impact_order = ['Negligible', 'Marginal', 'Serious', 'Critical', 'Catastrophic']
+    probability_order = ['Rare', 'Unlikely', 'Moderate', 'Likely', 'Almost Certain']
+    
+    # Create count matrix and risk ID matrix
+    matrix_data = []
+    risk_ids_matrix = []
+    
+    for impact in impact_order:
+        row_counts = []
+        row_risk_ids = []
+        for probability in probability_order:
+            risks = df[
+                (df['Impact / Consequence Rating'] == impact) & 
+                (df['Probability / Likelihood Rating'] == probability)
+            ]
+            count = len(risks)
+            risk_ids = ', '.join(risks['Risk ID'].astype(str)) if len(risks) > 0 else 'None'
+            row_counts.append(count)
+            row_risk_ids.append(risk_ids)
+        matrix_data.append(row_counts)
+        risk_ids_matrix.append(row_risk_ids)
+    
+    # Create custom hover text
+    hover_text = []
+    for i, impact in enumerate(impact_order):
+        hover_row = []
+        for j, probability in enumerate(probability_order):
+            count = matrix_data[i][j]
+            risk_ids = risk_ids_matrix[i][j]
+            if count > 0:
+                hover_text.append(f"<b>Impact:</b> {impact}<br><b>Probability:</b> {probability}<br><b>Number of Risks:</b> {count}<br><b>Risk IDs:</b> {risk_ids}")
             else:
-                cnt = int(z[PROBABILITY_ORDER.index(r), IMPACT_ORDER.index(c)])
-                h = f"Probability: {r}<br>Impact: {c}<br>Count: {cnt}"
-            if info["count"] > 0:
-                sample = ", ".join(info["risk_ids"][:8])
-                h += f"<br>Risk IDs: {sample}"
-            row_hover.append(h)
-        hover.append(row_hover)
-
-    # Use high contrast color scales; plotly supports 'Turbo' as 'Turbo' when using colorscale param
-    fig = go.Figure(data=go.Heatmap(
-        z=z,
-        x=IMPACT_ORDER,
-        y=PROBABILITY_ORDER,
-        hoverinfo="text",
-        hovertext=hover,
-        colorscale=color_scale,
-        colorbar=dict(title=("Avg Severity" if value_mode == "AverageSeverity" else "Count"))
-    ))
-    fig.update_layout(
-        xaxis_title="Impact / Consequence Rating",
-        yaxis_title="Probability / Likelihood Rating",
-        title_text=filters_text,
-        height=650,
-        margin=dict(l=60, r=20, t=80, b=60)
+                hover_text.append(f"<b>Impact:</b> {impact}<br><b>Probability:</b> {probability}<br><b>Number of Risks:</b> 0<br><b>Risk IDs:</b> None")
+        #hover_text.append(hover_row)
+    
+    # Reshape hover text to match matrix shape
+    hover_text_2d = []
+    for i in range(len(impact_order)):
+        start_idx = i * len(probability_order)
+        end_idx = start_idx + len(probability_order)
+        hover_text_2d.append(hover_text[start_idx:end_idx])
+    
+    # Create heatmap with custom hover data
+    fig = px.imshow(
+        matrix_data,
+        x=probability_order,
+        y=impact_order,
+        labels=dict(x="Probability", y="Impact", color="Number of Risks"),
+        color_continuous_scale=THEMES[theme],
+        aspect="auto"
     )
-    # Add annotations: counts in each cell for readability
-    annotations = []
-    for i, r in enumerate(PROBABILITY_ORDER):
-        for j, c in enumerate(IMPACT_ORDER):
-            v = mat.at[r, c]
-            if v > 0:
-                annotations.append(dict(
-                    x=c, y=r, text=str(int(v)), showarrow=False,
-                    font=dict(color="black", size=12)
-                ))
-    fig.update_layout(annotations=annotations)
+    
+    # Update hover template
+    fig.update_traces(
+        hovertemplate='%{customdata}<extra></extra>',
+        customdata=hover_text_2d
+    )
+    
+    # Add annotations
+    for i in range(len(impact_order)):
+        for j in range(len(probability_order)):
+            fig.add_annotation(
+                x=j, y=i,
+                text=str(matrix_data[i][j]),
+                showarrow=False,
+                font=dict(color="white" if matrix_data[i][j] > (max(map(max, matrix_data)) / 2) else "black", size=14)
+            )
+    
+    fig.update_layout(
+        title="Risk Assessment Matrix Heatmap<br><sub>Hover over cells to see Risk IDs</sub>",
+        xaxis_title="Probability / Likelihood Rating",
+        yaxis_title="Impact / Consequence Rating",
+        height=600
+    )
+    
     return fig
 
-# ---------------------------
-# Sidebar: Upload and options
-# ---------------------------
-st.sidebar.header("Upload")
-uploaded = st.sidebar.file_uploader("Upload Excel file (.xlsx)", type=["xlsx", "xls"])
-if not uploaded:
-    st.info("Please upload your Excel risk register (.xlsx).")
-    st.stop()
+def create_bubble_chart(df, theme):
+    # Define the order and numeric mapping for ratings
+    impact_order = ['Negligible', 'Marginal', 'Serious', 'Critical', 'Catastrophic']
+    probability_order = ['Rare', 'Unlikely', 'Moderate', 'Likely', 'Almost Certain']
+    
+    impact_numeric = {rating: i for i, rating in enumerate(impact_order)}
+    probability_numeric = {rating: i for i, rating in enumerate(probability_order)}
+    
+    # Prepare data for bubble chart
+    bubble_data = []
+    for impact in impact_order:
+        for probability in probability_order:
+            risks = df[
+                (df['Impact / Consequence Rating'] == impact) & 
+                (df['Probability / Likelihood Rating'] == probability)
+            ]
+            count = len(risks)
+            if count > 0:
+                bubble_data.append({
+                    'Impact': impact,
+                    'Probability': probability,
+                    'Count': count,
+                    'Impact_Numeric': impact_numeric[impact],
+                    'Probability_Numeric': probability_numeric[probability],
+                    'Risk_Ids': ', '.join(risks['Risk ID'].astype(str))
+                })
+    
+    bubble_df = pd.DataFrame(bubble_data)
+    
+    if bubble_df.empty:
+        # Return empty figure with message
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No data available for selected filters",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, xanchor='center', yanchor='middle',
+            showarrow=False,
+            font=dict(size=16)
+        )
+        fig.update_layout(height=600)
+        return fig
+    
+    # Create bubble chart with enhanced hover
+    fig = px.scatter(
+        bubble_df,
+        x='Probability_Numeric',
+        y='Impact_Numeric',
+        size='Count',
+        size_max=50,
+        hover_data={
+            'Impact': True,
+            'Probability': True,
+            'Count': True,
+            'Risk_Ids': True,
+            'Impact_Numeric': False,
+            'Probability_Numeric': False
+        },
+        color='Count',
+        color_continuous_scale=THEMES[theme],
+        labels={
+            'Probability_Numeric': 'Probability',
+            'Impact_Numeric': 'Impact',
+            'Count': 'Number of Risks'
+        }
+    )
+    
+    # Customize hover template
+    fig.update_traces(
+        hovertemplate='<b>Impact:</b> %{customdata[0]}<br>' +
+                     '<b>Probability:</b> %{customdata[1]}<br>' +
+                     '<b>Number of Risks:</b> %{customdata[2]}<br>' +
+                     '<b>Risk IDs:</b> %{customdata[3]}<extra></extra>'
+    )
+    
+    # Update axes
+    fig.update_xaxes(
+        tickvals=list(range(len(probability_order))),
+        ticktext=probability_order
+    )
+    fig.update_yaxes(
+        tickvals=list(range(len(impact_order))),
+        ticktext=impact_order
+    )
+    
+    fig.update_layout(
+        title="Risk Assessment Bubble Chart<br><sub>Hover over bubbles to see Risk IDs</sub>",
+        xaxis_title="Probability / Likelihood Rating",
+        yaxis_title="Impact / Consequence Rating",
+        height=600,
+        showlegend=False
+    )
+    
+    return fig
 
-st.sidebar.subheader("Visualization options")
-color_choice = st.sidebar.selectbox("Color (high contrast)", options=COLOR_OPTIONS, index=0)
-value_mode_choice = st.sidebar.radio("Heatmap value", options=["Count", "AverageSeverity"], index=0,
-                                     help="Count = number of risks per cell; AverageSeverity = avg (probabilityOrdinal x impactOrdinal)")
-alt_choice = st.sidebar.radio("Main visualization", options=["Heatmap", "Tree Map", "Bubble Map"], index=0)
-
-# ---------------------------
-# Load and prepare data
-# ---------------------------
-try:
-    df_raw = read_excel(uploaded)
-except Exception as e:
-    st.error(f"Failed to read Excel file: {e}")
-    st.stop()
-
-# Map columns to canonical internal names
-df = map_exact_columns(df_raw)
-
-# Ensure required canonical columns exist; create helpful errors if not
-required = ["risk_id", "risk", "consequence_impact", "impact_rating", "probability_rating"]
-missing = [c for c in required if c not in df.columns]
-if missing:
-    st.error(f"Missing required columns in Excel. Required columns (exact names expected in Excel header):\n"
-             "- Risk ID\n- RISKS\n- CONSEQUENCE/ IMPACT\n- Impact / Consequence Rating\n- Probability / Likelihood Rating\n\n"
-             f"Missing mapped columns: {missing}\nPlease correct the Excel headers and re-upload.")
-    st.stop()
-
-# ---------------------------
-# Only two filters (as requested)
-# ---------------------------
-st.sidebar.subheader("Filters (only these two)")
-prob_filter = st.sidebar.multiselect("Probability / Likelihood Rating",
-                                     options=PROBABILITY_ORDER, default=PROBABILITY_ORDER)
-impact_filter = st.sidebar.multiselect("Impact / Consequence Rating",
-                                       options=IMPACT_ORDER, default=IMPACT_ORDER)
-
-# Apply filters by textual normalization
-df = df.copy()
-df["probability_rating_norm"] = df["probability_rating"].apply(normalize_rating_text)
-df["impact_rating_norm"] = df["impact_rating"].apply(normalize_rating_text)
-
-df = df[df["probability_rating_norm"].notna() & df["impact_rating_norm"].notna()]
-
-if prob_filter:
-    df = df[df["probability_rating_norm"].isin(prob_filter)]
-if impact_filter:
-    df = df[df["impact_rating_norm"].isin(impact_filter)]
-
-if df.empty:
-    st.warning("No records match the chosen filters. Try widening the filters.")
-    st.stop()
-
-# Build matrix & mapping
-mat, cell_map = prepare_matrix(df.rename(columns={"probability_rating":"probability_rating", "impact_rating":"impact_rating",
-                                                  "risk_id":"risk_id", "risk":"risk", "consequence_impact":"consequence_impact"}))
-
-filters_text = f"Filters — Probability: {', '.join(prob_filter) if prob_filter else 'All'} | Impact: {', '.join(impact_filter) if impact_filter else 'All'}"
-
-# ---------------------------
-# Main area: chart + interactions
-# ---------------------------
-col1, col2 = st.columns([3, 1])
-with col1:
-    st.subheader("Risk Matrix")
-    if alt_choice == "Heatmap":
-        fig = build_heatmap_figure(mat, color_choice, ("AverageSeverity" if value_mode_choice == "AverageSeverity" else "Count"),
-                                   cell_map, filters_text)
-        st.markdown("**Heatmap (click a cell to see Risk IDs & details).**")
-        # If plotly_events available: enable click
-        if PLOTLY_EVENTS:
-            clicked = plotly_events(fig, click_event=True, hover_event=False)
-            st.plotly_chart(fig, use_container_width=True)
-            if clicked:
-                ev = clicked[0]
-                # ev usually contains 'x' and 'y' as labels
-                xval = ev.get("x")
-                yval = ev.get("y")
-                try:
-                    # Clean to exact label
-                    impact_label = str(xval)
-                    prob_label = str(yval)
-                    key = (prob_label, impact_label)
-                except Exception:
-                    st.error("Could not parse click coordinates.")
-                    key = None
-                if key:
-                    info = cell_map.get(key, {"count": 0, "risk_ids": [], "risks": [], "consequences": []})
-                    if info["count"] == 0:
-                        st.info("No risks in this cell.")
-                    else:
-                        st.markdown(f"**Risks in cell ({prob_label} / {impact_label}) — {info['count']}**")
-                        sel = st.selectbox("Select Risk ID to view details", options=info["risk_ids"], key="heat_sel")
-                        if sel:
-                            row = df[df["risk_id"].astype(str) == str(sel)]
-                            if not row.empty:
-                                st.markdown("**RISK**")
-                                st.info(row.iloc[0].get("risk", "No description"))
-                                st.markdown("**CONSEQUENCE / IMPACT**")
-                                st.info(row.iloc[0].get("consequence_impact", "No details"))
+def create_bar_charts(df, theme):
+    # Create subplots
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=('Risks by Impact Level', 'Risks by Probability Level')
+    )
+    
+    # Impact distribution
+    impact_counts = df['Impact / Consequence Rating'].value_counts()
+    # Reindex to maintain order
+    impact_order = ['Negligible', 'Marginal', 'Serious', 'Critical', 'Catastrophic']
+    impact_counts = impact_counts.reindex([x for x in impact_order if x in impact_counts.index], fill_value=0)
+    
+    # Get risk IDs for each impact level
+    impact_risk_ids = {}
+    for impact in impact_counts.index:
+        risks = df[df['Impact / Consequence Rating'] == impact]
+        impact_risk_ids[impact] = ', '.join(risks['Risk ID'].astype(str)) if len(risks) > 0 else 'None'
+    
+    # Safe color calculation
+    if len(impact_counts) > 0:
+        if len(impact_counts) == 1:
+            colors = [px.colors.sample_colorscale(THEMES[theme], [0.5])[0]] * len(impact_counts)
         else:
-            # Fallback: no click support -> show chart and use dropdowns to pick cell
-            st.warning("`streamlit-plotly-events` not installed; use the cell selectors below.")
-            st.plotly_chart(fig, use_container_width=True)
-            sel_prob = st.selectbox("Select Probability", options=["(choose)"] + PROBABILITY_ORDER, index=0)
-            sel_imp = st.selectbox("Select Impact", options=["(choose)"] + IMPACT_ORDER, index=0)
-            if sel_prob != "(choose)" and sel_imp != "(choose)":
-                key = (sel_prob, sel_imp)
-                info = cell_map.get(key, {"count": 0, "risk_ids": []})
-                if info["count"] == 0:
-                    st.info("No risks in this selected cell.")
-                else:
-                    st.markdown(f"**Risks in cell ({sel_prob} / {sel_imp}) — {info['count']}**")
-                    sel = st.selectbox("Select Risk ID to view details (fallback)", options=info["risk_ids"], key="fallback_sel")
-                    if sel:
-                        row = df[df["risk_id"].astype(str) == str(sel)]
-                        if not row.empty:
-                            st.markdown("**RISK**")
-                            st.info(row.iloc[0].get("risk", "No description"))
-                            st.markdown("**CONSEQUENCE / IMPACT**")
-                            st.info(row.iloc[0].get("consequence_impact", "No details"))
-    elif alt_choice == "Tree Map":
-        st.subheader("Tree Map (groups = Probability_Impact)")
-        df_tm = df.copy()
-        df_tm["group"] = df_tm["probability_rating_norm"] + " / " + df_tm["impact_rating_norm"]
-        agg = df_tm.groupby("group").agg(count=("risk_id","count")).reset_index()
-        fig_tm = px.treemap(agg, path=["group"], values="count", color="count", color_continuous_scale=color_choice,
-                            title=filters_text)
-        st.plotly_chart(fig_tm, use_container_width=True)
-        st.markdown("Select a group (Probability / Impact) then a Risk ID to view details.")
-        groups = agg["group"].tolist()
-        chosen = st.selectbox("Choose group", options=["(choose)"] + groups)
-        if chosen and chosen != "(choose)":
-            subset = df_tm[df_tm["group"] == chosen]
-            ids = subset["risk_id"].astype(str).tolist()
-            sel = st.selectbox("Choose Risk ID", options=["(choose)"] + ids)
-            if sel and sel != "(choose)":
-                row = df[df["risk_id"].astype(str) == str(sel)]
-                if not row.empty:
-                    st.markdown("**RISK**")
-                    st.info(row.iloc[0].get("risk", "No description"))
-                    st.markdown("**CONSEQUENCE / IMPACT**")
-                    st.info(row.iloc[0].get("consequence_impact", "No details"))
-    elif alt_choice == "Bubble Map":
-        st.subheader("Bubble Map (each risk plotted; size = severity)")
-        # Map textual categories to numeric ordinal positions so they plot nicely
-        prob_to_num = {label: i+1 for i, label in enumerate(PROBABILITY_ORDER)}
-        impact_to_num = {label: i+1 for i, label in enumerate(IMPACT_ORDER)}
-        df_b = df.copy()
-        df_b["prob_num"] = df_b["probability_rating_norm"].map(prob_to_num)
-        df_b["imp_num"] = df_b["impact_rating_norm"].map(impact_to_num)
-        df_b["severity"] = df_b["prob_num"] * df_b["imp_num"]
-        fig_b = px.scatter(df_b, x="impact_rating_norm", y="probability_rating_norm",
-                           size="severity", hover_name="risk_id",
-                           hover_data={"risk": True, "consequence_impact": True, "severity": True},
-                           color="severity", color_continuous_scale=color_choice,
-                           category_orders={"impact_rating_norm": IMPACT_ORDER, "probability_rating_norm": PROBABILITY_ORDER},
-                           title=filters_text)
-        fig_b.update_layout(height=650)
-        st.plotly_chart(fig_b, use_container_width=True)
-        if PLOTLY_EVENTS:
-            clicked = plotly_events(fig_b, click_event=True, hover_event=False)
-            if clicked:
-                ev = clicked[0]
-                # try best-effort to get point index and risk_id
-                try:
-                    idx = ev.get("pointIndex")
-                    sel_row = df_b.iloc[int(idx)]
-                    sel_id = sel_row["risk_id"]
-                    st.markdown("**Selected Risk**")
-                    st.write("Risk ID:", sel_id)
-                    st.info(sel_row.get("risk", "No description"))
-                    st.write("CONSEQUENCE / IMPACT:")
-                    st.info(sel_row.get("consequence_impact", "No details"))
-                except Exception:
-                    st.info("Clicked point could not be resolved. Use hover to find Risk ID.")
+            colors = px.colors.sample_colorscale(THEMES[theme], [n/(len(impact_counts)-1) for n in range(len(impact_counts))])
+    else:
+        colors = ['lightgray']
+    
+    fig.add_trace(
+        go.Bar(
+            x=impact_counts.index,
+            y=impact_counts.values,
+            name='Impact',
+            marker_color=colors,
+            customdata=[impact_risk_ids[impact] for impact in impact_counts.index],
+            hovertemplate='<b>Impact:</b> %{x}<br>' +
+                         '<b>Number of Risks:</b> %{y}<br>' +
+                         '<b>Risk IDs:</b> %{customdata}<extra></extra>'
+        ),
+        row=1, col=1
+    )
+    
+    # Probability distribution
+    probability_counts = df['Probability / Likelihood Rating'].value_counts()
+    # Reindex to maintain order
+    probability_order = ['Rare', 'Unlikely', 'Moderate', 'Likely', 'Almost Certain']
+    probability_counts = probability_counts.reindex([x for x in probability_order if x in probability_counts.index], fill_value=0)
+    
+    # Get risk IDs for each probability level
+    probability_risk_ids = {}
+    for probability in probability_counts.index:
+        risks = df[df['Probability / Likelihood Rating'] == probability]
+        probability_risk_ids[probability] = ', '.join(risks['Risk ID'].astype(str)) if len(risks) > 0 else 'None'
+    
+    # Safe color calculation
+    if len(probability_counts) > 0:
+        if len(probability_counts) == 1:
+            colors_prob = [px.colors.sample_colorscale(THEMES[theme], [0.5])[0]] * len(probability_counts)
         else:
-            st.info("Clicking points requires `streamlit-plotly-events`. Use hover to find a Risk ID and paste into the selector below.")
-            hover_choice = st.text_input("Enter a Risk ID from hover to view details (e.g., R00012):")
-            if hover_choice:
-                row = df[df["risk_id"].astype(str) == hover_choice.strip()]
-                if not row.empty:
-                    st.markdown("**RISK**")
-                    st.info(row.iloc[0].get("risk", "No description"))
-                    st.write("CONSEQUENCE / IMPACT:")
-                    st.info(row.iloc[0].get("consequence_impact", "No details"))
+            colors_prob = px.colors.sample_colorscale(THEMES[theme], [n/(len(probability_counts)-1) for n in range(len(probability_counts))])
+    else:
+        colors_prob = ['lightgray']
+    
+    fig.add_trace(
+        go.Bar(
+            x=probability_counts.index,
+            y=probability_counts.values,
+            name='Probability',
+            marker_color=colors_prob,
+            customdata=[probability_risk_ids[probability] for probability in probability_counts.index],
+            hovertemplate='<b>Probability:</b> %{x}<br>' +
+                         '<b>Number of Risks:</b> %{y}<br>' +
+                         '<b>Risk IDs:</b> %{customdata}<extra></extra>'
+        ),
+        row=1, col=2
+    )
+    
+    fig.update_layout(
+        title_text="Risk Distribution Analysis<br><sub>Hover over bars to see Risk IDs</sub>",
+        height=500,
+        showlegend=False
+    )
+    
+    fig.update_xaxes(tickangle=45)
+    
+    return fig
 
-with col2:
-    st.subheader("Summary")
-    st.write("Total risks (filtered):", df["risk_id"].nunique())
-    st.write("Active Probability filters:", ", ".join(prob_filter) if prob_filter else "All")
-    st.write("Active Impact filters:", ", ".join(impact_filter) if impact_filter else "All")
+def create_treemap(df, theme):
+    # Create treemap data
+    treemap_data = []
+    for _, row in df.iterrows():
+        treemap_data.append({
+            'Risk_ID': row['Risk ID'],
+            'Impact': row['Impact / Consequence Rating'],
+            'Probability': row['Probability / Likelihood Rating'],
+            'Risk_Level': f"{row['Impact / Consequence Rating']} - {row['Probability / Likelihood Rating']}",
+            'Count': 1
+        })
+    
+    treemap_df = pd.DataFrame(treemap_data)
+    
+    if treemap_df.empty:
+        # Return empty figure with message
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No data available for selected filters",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, xanchor='center', yanchor='middle',
+            showarrow=False,
+            font=dict(size=16)
+        )
+        fig.update_layout(height=600, title="Risk Distribution Treemap")
+        return fig
+    
+    # Create risk level counts
+    risk_level_counts = treemap_df.groupby(['Impact', 'Probability', 'Risk_Level']).size().reset_index(name='Count')
+    
+    # Get all risk IDs for each combination
+    risk_ids_by_combo = {}
+    for _, row in risk_level_counts.iterrows():
+        impact = row['Impact']
+        probability = row['Probability']
+        risks = df[
+            (df['Impact / Consequence Rating'] == impact) & 
+            (df['Probability / Likelihood Rating'] == probability)
+        ]
+        risk_ids_by_combo[(impact, probability)] = ', '.join(risks['Risk ID'].astype(str))
+    
+    # Add risk IDs to the dataframe
+    risk_level_counts['Risk_Ids'] = risk_level_counts.apply(
+        lambda x: risk_ids_by_combo.get((x['Impact'], x['Probability']), 'None'), 
+        axis=1
+    )
+    
+    # Create treemap
+    fig = px.treemap(
+        risk_level_counts,
+        path=['Impact', 'Probability'],
+        values='Count',
+        color='Impact',
+        color_continuous_scale=THEMES[theme],
+        title="Risk Distribution Treemap<br><sub>Hover over sections to see Risk IDs</sub>",
+        custom_data=['Risk_Ids']
+    )
+    
+    # Update hover template
+    fig.update_traces(
+        hovertemplate='<b>%{label}</b><br>' +
+                     'Number of Risks: %{value}<br>' +
+                     'Risk IDs: %{customdata[0]}<extra></extra>'
+    )
+    
+    fig.update_layout(height=600)
+    
+    return fig
+
+def create_risk_details_table(df):
+    """Create an expandable risk details table"""
+    if len(df) == 0:
+        return None
+    
+    # Select columns to display
+    display_columns = ['Risk ID', 'RISKS', 'Impact / Consequence Rating', 
+                     'Probability / Likelihood Rating', 'Inherent Risk Rating', 
+                     'Risk Classification']
+    
+    # Select only columns that exist in the dataframe
+    available_columns = [col for col in display_columns if col in df.columns]
+    
+    return df[available_columns]
+
+def main():
+    st.set_page_config(page_title="Risk Assessment Dashboard", layout="wide")
+    
+    st.title("🚨 Business Risk Assessment Dashboard")
     st.markdown("---")
-    st.subheader("Download")
-    csv = df.to_csv(index=False).encode("utf-8")
-    st.download_button("Download filtered CSV", data=csv, file_name="jobnix_filtered.csv", mime="text/csv")
+    
+    # File upload
+    uploaded_file = st.file_uploader("Upload your Risk Register Excel file", type=['xlsx'])
+    
+    if uploaded_file is not None:
+        df = load_data(uploaded_file)
+        
+        if df is not None:
+            st.success(f"✅ Successfully loaded {len(df)} risk records")
+            
+            # Display basic info
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total Risks", len(df))
+            with col2:
+                high_impact = len(df[df['Impact / Consequence Rating'].isin(['Critical', 'Catastrophic'])])
+                st.metric("High Impact Risks", high_impact)
+            with col3:
+                high_prob = len(df[df['Probability / Likelihood Rating'].isin(['Likely', 'Almost Certain'])])
+                st.metric("High Probability Risks", high_prob)
+            with col4:
+                critical_risks = len(df[
+                    (df['Impact / Consequence Rating'].isin(['Critical', 'Catastrophic'])) & 
+                    (df['Probability / Likelihood Rating'].isin(['Likely', 'Almost Certain']))
+                ])
+                st.metric("Critical Risks", critical_risks)
+            
+            st.markdown("---")
+            
+            # Filters and Theme Selection in sidebar
+            st.sidebar.header("🎛️ Dashboard Controls")
+            
+            # Theme selection
+            selected_theme = st.sidebar.selectbox(
+                "🎨 Select Color Theme",
+                list(THEMES.keys()),
+                index=0
+            )
+            
+            st.sidebar.markdown("---")
+            st.sidebar.header("🔍 Risk Filters")
+            
+            # Multi-select filters
+            impact_options = sorted(df['Impact / Consequence Rating'].unique())
+            selected_impacts = st.sidebar.multiselect(
+                "Impact Levels",
+                impact_options,
+                default=impact_options,
+                help="Select one or more impact levels to filter"
+            )
+            
+            probability_options = sorted(df['Probability / Likelihood Rating'].unique())
+            selected_probabilities = st.sidebar.multiselect(
+                "Probability Levels",
+                probability_options,
+                default=probability_options,
+                help="Select one or more probability levels to filter"
+            )
+            
+            # Apply filters
+            filtered_df = df.copy()
+            if selected_impacts:
+                filtered_df = filtered_df[filtered_df['Impact / Consequence Rating'].isin(selected_impacts)]
+            if selected_probabilities:
+                filtered_df = filtered_df[filtered_df['Probability / Likelihood Rating'].isin(selected_probabilities)]
+            
+            st.sidebar.info(f"Showing {len(filtered_df)} of {len(df)} risks")
+            
+            # Reset filters button
+            if st.sidebar.button("🔄 Reset All Filters"):
+                st.rerun()
+            
+            # Visualizations
+            tab1, tab2, tab3, tab4 = st.tabs(["📊 Heat Map", "🟠 Bubble Chart", "📈 Bar Charts", "🌳 Treemap"])
+            
+            with tab1:
+                st.plotly_chart(create_risk_matrix(filtered_df, selected_theme), use_container_width=True)
+                
+            with tab2:
+                st.plotly_chart(create_bubble_chart(filtered_df, selected_theme), use_container_width=True)
+                
+            with tab3:
+                st.plotly_chart(create_bar_charts(filtered_df, selected_theme), use_container_width=True)
+                
+            with tab4:
+                st.plotly_chart(create_treemap(filtered_df, selected_theme), use_container_width=True)
+            
+            # Risk Details Section
+            st.markdown("---")
+            st.subheader("📋 Risk Details")
+            
+            if len(filtered_df) > 0:
+                # Display risk details in an expandable section
+                with st.expander(f"View All {len(filtered_df)} Filtered Risks", expanded=True):
+                    risk_details = create_risk_details_table(filtered_df)
+                    if risk_details is not None:
+                        st.dataframe(
+                            risk_details,
+                            use_container_width=True,
+                            height=400
+                        )
+                        
+                        # Download filtered data
+                        csv = risk_details.to_csv(index=False)
+                        st.download_button(
+                            label="📥 Download Filtered Risks as CSV",
+                            data=csv,
+                            file_name="filtered_risks.csv",
+                            mime="text/csv",
+                            key="download_csv"
+                        )
+            else:
+                st.info("No risks match the selected filters")
+            
+            # Risk summary
+            st.markdown("---")
+            st.subheader("📊 Risk Summary")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.write("**Impact Distribution:**")
+                impact_summary = filtered_df['Impact / Consequence Rating'].value_counts()
+                if len(impact_summary) > 0:
+                    for impact, count in impact_summary.items():
+                        st.write(f"- {impact}: {count} risks")
+                else:
+                    st.write("No impact data available")
+            
+            with col2:
+                st.write("**Probability Distribution:**")
+                prob_summary = filtered_df['Probability / Likelihood Rating'].value_counts()
+                if len(prob_summary) > 0:
+                    for prob, count in prob_summary.items():
+                        st.write(f"- {prob}: {count} risks")
+                else:
+                    st.write("No probability data available")
+                    
+        else:
+            st.error("Failed to load data. Please check the file format.")
+    else:
+        st.info("👆 Please upload an Excel file to begin analysis")
+        
+        # Display sample of expected format
+        st.subheader("Expected Data Format")
+        st.write("""
+        Your Excel file should contain these key columns:
+        - **Risk ID**: Unique identifier for each risk
+        - **RISKS**: Description of the risk
+        - **Impact / Consequence Rating**: Negligible, Marginal, Serious, Critical, or Catastrophic
+        - **Probability / Likelihood Rating**: Rare, Unlikely, Moderate, Likely, or Almost Certain
+        - **Inherent Risk Rating**: Calculated risk score
+        - **Risk Classification**: Risk category
+        """)
 
-st.caption("Heatmap axes use the exact textual order you specified. Color and alternatives are high-contrast for visibility.")
+if __name__ == "__main__":
+    main()

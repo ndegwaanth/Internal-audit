@@ -15,11 +15,11 @@ def load_data(uploaded_file):
         df.columns = [col.strip() for col in df.columns]
         
         # Standardize rating columns
-        rating_columns = ['Impact / Consequence Rating', 'Probability / Likelihood Rating']
+        rating_columns = ['Impact / Consequence Rating', 'Probability / Likelihood Rating', 'Risk Classification']
         
         for col in rating_columns:
             if col in df.columns:
-                df[col] = df[col].astype(str).str.strip().str.title()
+                df[col] = df[col].astype(str).str.strip()
         
         return df
     except Exception as e:
@@ -394,13 +394,32 @@ def main():
         if df is not None:
             st.success(f"✅ Successfully loaded {len(df)} risk records")
             
-            # Display basic info
+            # Display basic info with Risk Classification
             col1, col2, col3, col4 = st.columns(4)
             with col1:
                 st.metric("Total Risks", len(df))
             with col2:
-                high_impact = len(df[df['Impact / Consequence Rating'].isin(['Critical', 'Catastrophic'])])
-                st.metric("High Impact Risks", high_impact)
+                # Count risks by Risk Classification
+                if 'Risk Classification' in df.columns:
+                    # Get the distribution of risk classifications
+                    risk_class_counts = df['Risk Classification'].value_counts()
+                    
+                    # Create a clean display of the classifications
+                    if len(risk_class_counts) > 0:
+                        # Show the most common classification as the metric
+                        most_common = risk_class_counts.idxmax()
+                        count_most_common = risk_class_counts.max()
+                        
+                        # Create a formatted string for the metric label
+                        st.metric(
+                            "Risk Classification", 
+                            f"{most_common}",
+                            help=f"Most common risk classification. Total breakdown: {', '.join([f'{k}: {v}' for k, v in risk_class_counts.items()])}"
+                        )
+                    else:
+                        st.metric("Risk Classification", "No Data")
+                else:
+                    st.metric("Risk Classification", "Column Not Found")
             with col3:
                 high_prob = len(df[df['Probability / Likelihood Rating'].isin(['Likely', 'Almost Certain'])])
                 st.metric("High Probability Risks", high_prob)
@@ -410,6 +429,16 @@ def main():
                     (df['Probability / Likelihood Rating'].isin(['Likely', 'Almost Certain']))
                 ])
                 st.metric("Critical Risks", critical_risks)
+            
+            # Optional: Show detailed breakdown of Risk Classifications
+            if 'Risk Classification' in df.columns:
+                risk_class_counts = df['Risk Classification'].value_counts()
+                if len(risk_class_counts) > 0:
+                    with st.expander("📊 Detailed Risk Classification Breakdown", expanded=False):
+                        cols = st.columns(min(4, len(risk_class_counts)))
+                        for idx, (classification, count) in enumerate(risk_class_counts.items()):
+                            with cols[idx % len(cols)]:
+                                st.metric(f"{classification} Risks", count)
             
             st.markdown("---")
             
@@ -426,7 +455,7 @@ def main():
             st.sidebar.markdown("---")
             st.sidebar.header("🔍 Risk Filters")
             
-            # Multi-select filters
+            # Multi-select filters for Impact
             impact_options = sorted(df['Impact / Consequence Rating'].unique())
             selected_impacts = st.sidebar.multiselect(
                 "Impact Levels",
@@ -435,6 +464,7 @@ def main():
                 help="Select one or more impact levels to filter"
             )
             
+            # Multi-select filters for Probability
             probability_options = sorted(df['Probability / Likelihood Rating'].unique())
             selected_probabilities = st.sidebar.multiselect(
                 "Probability Levels",
@@ -443,12 +473,24 @@ def main():
                 help="Select one or more probability levels to filter"
             )
             
+            # Optional: Filter by Risk Classification
+            if 'Risk Classification' in df.columns:
+                classification_options = sorted(df['Risk Classification'].unique())
+                selected_classifications = st.sidebar.multiselect(
+                    "Risk Classifications",
+                    classification_options,
+                    default=classification_options,
+                    help="Select one or more risk classifications to filter"
+                )
+            
             # Apply filters
             filtered_df = df.copy()
             if selected_impacts:
                 filtered_df = filtered_df[filtered_df['Impact / Consequence Rating'].isin(selected_impacts)]
             if selected_probabilities:
                 filtered_df = filtered_df[filtered_df['Probability / Likelihood Rating'].isin(selected_probabilities)]
+            if 'Risk Classification' in df.columns and 'selected_classifications' in locals():
+                filtered_df = filtered_df[filtered_df['Risk Classification'].isin(selected_classifications)]
             
             st.sidebar.info(f"Showing {len(filtered_df)} of {len(df)} risks")
             
@@ -522,6 +564,17 @@ def main():
                 else:
                     st.write("No probability data available")
                     
+            # Risk Classification Summary
+            if 'Risk Classification' in filtered_df.columns:
+                st.markdown("---")
+                st.subheader("🏷️ Risk Classification Summary")
+                classification_summary = filtered_df['Risk Classification'].value_counts()
+                if len(classification_summary) > 0:
+                    cols = st.columns(min(3, len(classification_summary)))
+                    for idx, (classification, count) in enumerate(classification_summary.items()):
+                        with cols[idx % len(cols)]:
+                            st.metric(f"{classification}", count)
+                    
         else:
             st.error("Failed to load data. Please check the file format.")
     else:
@@ -536,7 +589,7 @@ def main():
         - **Impact / Consequence Rating**: Negligible, Marginal, Serious, Critical, or Catastrophic
         - **Probability / Likelihood Rating**: Rare, Unlikely, Moderate, Likely, or Almost Certain
         - **Inherent Risk Rating**: Calculated risk score
-        - **Risk Classification**: Risk category
+        - **Risk Classification**: Risk category (Acceptable, Action Advisable, Action Required, Unacceptable)
         """)
 
 if __name__ == "__main__":
